@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--figma-color-bg, #ffffff);
+      --text: var(--figma-color-text, #1f1f1f);
+      --muted: var(--figma-color-text-secondary, #6f6f6f);
+      --border: var(--figma-color-border, #d9d9d9);
+      --brand: var(--figma-color-bg-brand, #18a0fb);
+      --brand-text: var(--figma-color-text-onbrand, #ffffff);
+      --panel: var(--figma-color-bg-secondary, #f5f5f5);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 20px;
+      background: var(--bg);
+      color: var(--text);
+      font: 12px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    fieldset {
+      margin: 18px 0 0;
+      padding: 0;
+      border: 0;
+    }
+
+    legend {
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .option {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      min-height: 34px;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .option:last-child {
+      border-bottom: 0;
+    }
+
+    input[type="checkbox"] {
+      width: 14px;
+      height: 14px;
+      margin: 2px 0 0;
+      accent-color: var(--brand);
+      flex: 0 0 auto;
+    }
+
+    label {
+      display: block;
+      font-weight: 600;
+    }
+
+    .hint {
+      display: block;
+      color: var(--muted);
+      font-weight: 400;
+    }
+
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-top: 18px;
+    }
+
+    button {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    .primary {
+      background: var(--brand);
+      color: var(--brand-text);
+    }
+
+    .secondary {
+      background: var(--panel);
+      color: var(--text);
+      border-color: var(--border);
+    }
+
+    .ghost {
+      background: transparent;
+      color: var(--muted);
+      border-color: transparent;
+    }
+
+    #result {
+      min-height: 68px;
+      margin-top: 16px;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      white-space: pre-wrap;
+    }
+
+    #toast {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      display: none;
+      max-width: 300px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: #d93025;
+      color: #fff;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+      font-weight: 700;
+      white-space: pre-wrap;
+    }
+
+  </style>
+</head>
+<body>
+  <div id="toast"></div>
+  <h1>Data Cleaner</h1>
+  <p>選択した処理を、ページ全体・選択アートボード・選択範囲に実行します。</p>
+
+  <fieldset>
+    <legend>処理</legend>
+
+    <div class="option">
+      <input id="removeTextStyles" type="checkbox" checked>
+      <label for="removeTextStyles">
+        テキストスタイルの削除
+        <span class="hint">ファイル内のローカルTextStyleを削除します。</span>
+      </label>
+    </div>
+
+    <div class="option">
+      <input id="convertGroups" type="checkbox" checked>
+      <label for="convertGroups">
+        グループをフレーム化
+        <span class="hint">グループを同名のFrameに置き換えます。</span>
+      </label>
+    </div>
+
+    <div class="option">
+      <input id="removeAnnotations" type="checkbox" checked>
+      <label for="removeAnnotations">
+        アノテーション削除
+        <span class="hint">Dev Mode annotationsを空にします。</span>
+      </label>
+    </div>
+
+    <div class="option">
+      <input id="createAnnotationTable" type="checkbox">
+      <label for="createAnnotationTable">
+        アノテーション一覧テーブル作成
+        <span class="hint">内容・タグ・アートボード・リンクをキャンバス上に作成します。</span>
+      </label>
+    </div>
+  </fieldset>
+
+  <div class="actions">
+    <button class="primary" id="runPage">ページ内全体を実行</button>
+    <button class="secondary" id="runArtboards">選択したアートボードを実行</button>
+    <button class="secondary" id="runSelection">選択した範囲を実行</button>
+    <button class="ghost" id="cancel">閉じる</button>
+  </div>
+
+  <div id="result">未実行</div>
+
+  <script>
+    const optionIds = [
+      'removeTextStyles',
+      'convertGroups',
+      'removeAnnotations',
+      'createAnnotationTable'
+    ];
+    function getOptions() {
+      return optionIds.reduce((options, id) => {
+        options[id] = document.getElementById(id).checked;
+        return options;
+      }, {});
+    }
+
+    function run(scope) {
+      document.getElementById('result').textContent = '実行中...';
+      hideToast();
+      parent.postMessage({
+        pluginMessage: {
+          type: 'run',
+          scope,
+          options: getOptions(),
+          fileUrl: document.referrer || ''
+        }
+      }, '*');
+    }
+
+    function showToast(lines) {
+      const toast = document.getElementById('toast');
+      toast.textContent = lines.slice(0, 4).join('\n');
+      toast.style.display = 'block';
+      window.setTimeout(hideToast, 8000);
+    }
+
+    function hideToast() {
+      document.getElementById('toast').style.display = 'none';
+    }
+
+    document.getElementById('runPage').onclick = () => run('page');
+    document.getElementById('runSelection').onclick = () => run('selection');
+    document.getElementById('runArtboards').onclick = () => run('artboards');
+    document.getElementById('createAnnotationTable').onchange = (event) => {
+      if (!event.target.checked) return;
+      document.getElementById('removeTextStyles').checked = false;
+      document.getElementById('convertGroups').checked = false;
+      document.getElementById('removeAnnotations').checked = false;
+    };
+    document.getElementById('cancel').onclick = () => {
+      parent.postMessage({ pluginMessage: { type: 'cancel' } }, '*');
+    };
+
+    window.onmessage = (event) => {
+      const message = event.data.pluginMessage;
+      if (!message) return;
+
+      const result = document.getElementById('result');
+      if (message.type === 'error') {
+        result.textContent = message.message;
+        showToast([message.message]);
+        return;
+      }
+
+      if (message.type === 'result') {
+        const stats = message.stats;
+        result.textContent = [
+          `アノテーション削除: ${stats.annotations}`,
+          `TextStyle削除: ${stats.textStyles}`,
+          `フレーム化: ${stats.groups}`,
+          `一覧行数: ${stats.tableRows}`,
+          `絶対位置注釈: ${stats.absoluteAnnotations}`,
+          `失敗: ${stats.errors.length}`,
+          `スキップ: ${stats.warnings.length}`,
+        ].concat(stats.errors).concat(stats.warnings).join('\n');
+        if (stats.errors.length || stats.warnings.length) {
+          showToast(stats.errors.concat(stats.warnings));
+        }
+      }
+    };
+  </script>
+</body>
+</html>

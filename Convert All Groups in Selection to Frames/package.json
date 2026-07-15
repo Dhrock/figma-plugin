@@ -1,0 +1,8 @@
+{
+  "name": "convert-all-groups-in-selection-to-frames",
+  "version": "1.0.0",
+  "description": "Convert every group inside the current Figma selection to frames.",
+  "main": "code.js",
+  "author": "",
+  "license": ""
+}

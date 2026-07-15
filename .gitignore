@@ -1,0 +1,16 @@
+# macOS Finder metadata
+.DS_Store
+
+# Node.js dependencies and logs
+node_modules/
+*.log
+*.log.*
+
+# Local environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+out/

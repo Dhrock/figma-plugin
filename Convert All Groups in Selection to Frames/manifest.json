@@ -1,0 +1,7 @@
+{
+  "name": "選択範囲全てのグループ → フレーム化",
+  "id": "convert-all-groups-in-selection-to-frames",
+  "api": "1.0.0",
+  "main": "code.js",
+  "editorType": ["figma"]
+}
