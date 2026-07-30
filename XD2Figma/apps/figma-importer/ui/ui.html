@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <style>
+    :root { color-scheme: light dark; --bg: var(--figma-color-bg, #fff); --text: var(--figma-color-text, #222); --muted: var(--figma-color-text-secondary, #6b6b6b); --border: var(--figma-color-border, #ddd); --brand: var(--figma-color-bg-brand, #0d99ff); --danger: #d92d20; --warn: #b54708; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 18px; background: var(--bg); color: var(--text); font: 12px/1.5 Inter, system-ui, sans-serif; }
+    h1 { margin: 0 0 4px; font-size: 16px; }
+    p { margin: 0 0 12px; color: var(--muted); }
+    input[type=file] { width: 100%; margin: 8px 0 14px; }
+    button { min-height: 34px; padding: 0 14px; border: 1px solid var(--border); border-radius: 6px; background: var(--figma-color-bg-secondary, #f3f3f3); color: var(--text); font: inherit; font-weight: 700; cursor: pointer; }
+    button.primary { background: var(--brand); color: #fff; border-color: transparent; }
+    button:disabled { opacity: .45; cursor: default; }
+    .actions { display: flex; gap: 8px; margin-top: 14px; }
+    #status { min-height: 34px; margin: 8px 0; padding: 8px; border-radius: 6px; background: var(--figma-color-bg-secondary, #f5f5f5); white-space: pre-wrap; }
+    #issues { max-height: 360px; overflow: auto; border-top: 1px solid var(--border); }
+    .issue { padding: 9px 2px; border-bottom: 1px solid var(--border); }
+    .issue.fatal, .issue.blocker { color: var(--danger); }
+    .issue.approvable { color: var(--warn); }
+    .issue.warning { color: var(--muted); }
+    .issue label { display: flex; gap: 8px; align-items: flex-start; color: var(--text); }
+    .code { font-weight: 700; }
+    .meta { color: var(--muted); font-size: 11px; }
+    select { max-width: 190px; margin-top: 4px; }
+    #recovery { display: none; margin-bottom: 12px; padding: 10px; border: 1px solid var(--warn); border-radius: 6px; }
+    #visualReview { display: none; margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+    .visual-item { padding: 10px 0; border-bottom: 1px solid var(--border); }
+    .visual-item img { display: block; max-width: 100%; max-height: 180px; margin-top: 6px; background: #fff; }
+  </style>
+</head>
+<body>
+  <div id="recovery">
+    <strong>前回中断したステージングページがあります。</strong>
+    <p id="recoveryText"></p>
+    <button id="cleanup">確認して削除</button>
+  </div>
+  <h1>XD2Figma Importer</h1>
+  <p>.xd2figを検査し、互換性問題は警告として記録しながら全アートボードをベストエフォートで移植します。見つからないフォントはNoto Sansへ置換します。</p>
+  <input id="packageFile" type="file" accept=".xd2fig,application/zip">
+  <div id="status">パッケージを選択してください。</div>
+  <div id="issues"></div>
+  <div id="visualReview">
+    <strong>視覚差分（参考値・人間承認）</strong>
+    <p>レンダラー差を含むため、数値はハードゲートではありません。チェック状態は監査記録にだけ使用され、未チェックでもインポートできます。</p>
+    <div id="visualItems"></div>
+    <button class="primary" id="finalize">全件インポートを確定</button>
+  </div>
+  <div class="actions">
+    <button class="primary" id="import" disabled>インポート</button>
+    <button id="cancel">閉じる</button>
+  </div>
+
+  <script>
+    const CHUNK_BYTES = 4 * 1024 * 1024;
+    const V1_LIMITS = { archiveBytes: Math.floor(1.5 * 1024 * 1024 * 1024), uncompressedBytes: 2 * 1024 * 1024 * 1024, assetBytes: 1024 * 1024 * 1024, entries: 10000, manifestBytes: 1024 * 1024 };
+    const decoder = new TextDecoder();
+    let packageFile = null;
+    let directory = new Map();
+    let manifest = null;
+    let documentData = null;
+    let plainTextData = null;
+    let layerDatabaseData = null;
+    let packageHash = '';
+    let issues = [];
+    let approvalRecords = [];
+    let recoveryPageIds = [];
+    let ackResolver = null;
+    let visualWork = Promise.resolve();
+    const visualResults = new Map();
+
+    const status = document.getElementById('status');
+    const issueList = document.getElementById('issues');
+    const importButton = document.getElementById('import');
+
+    document.getElementById('packageFile').onchange = async (event) => {
+      packageFile = event.target.files[0] || null;
+      if (!packageFile) return;
+      importButton.disabled = true;
+      issueList.replaceChildren();
+      try {
+        setStatus('ZIPディレクトリを検査中...');
+        if (packageFile.size > V1_LIMITS.archiveBytes) throw new Error('PACKAGE_TOO_LARGE: archive');
+        directory = await readCentralDirectory(packageFile);
+        const manifestEntry = requiredEntry('manifest.json');
+        if (manifestEntry.uncompressedSize > V1_LIMITS.manifestBytes) throw new Error('PACKAGE_TOO_LARGE: manifest');
+        const manifestBytes = await readEntry(packageFile, manifestEntry);
+        manifest = JSON.parse(decoder.decode(manifestBytes));
+        validatePackageDirectory(directory, manifest);
+        packageHash = await sha256Hex(manifestBytes);
+        const documentBytes = await readAndVerify('document.json');
+        plainTextData = manifest.files['texts.json']
+          ? JSON.parse(decoder.decode(await readAndVerify('texts.json')))
+          : null;
+        layerDatabaseData = manifest.files['layers.json']
+          ? JSON.parse(decoder.decode(await readAndVerify('layers.json')))
+          : null;
+        await readAndVerify('coordinates.csv');
+        await readAndVerify('fonts.json');
+        await readAndVerify('assets/index.json');
+        await readAndVerify('preflight.json');
+        documentData = JSON.parse(decoder.decode(documentBytes));
+        setStatus('Figma環境とフォントを検査中...');
+        parent.postMessage({ pluginMessage: { type: 'preflight', manifest, document: documentData, plainText: plainTextData, layerDatabase: layerDatabaseData, packageHash } }, '*');
+      } catch (error) {
+        setStatus(`エラー: ${error.message || error}`);
+      }
+    };
+
+    importButton.onclick = () => {
+      const approvals = [];
+      for (const issue of issues.filter((item) => item.severity === 'approvable')) {
+        const checkbox = document.getElementById(`approve-${safeId(issue.id)}`);
+        if (!checkbox?.checked) continue;
+        const select = document.getElementById(`action-${safeId(issue.id)}`);
+        approvals.push({
+          issueId: issue.id,
+          action: select.value,
+          parameters: actionParameters(select.value, issue),
+          approver: { name: 'Figma current user' },
+          approvedAt: new Date().toISOString(),
+          packageHash,
+          toolVersion: '0.1.0'
+        });
+      }
+      approvalRecords = approvals;
+      importButton.disabled = true;
+      setStatus('承認・除外範囲を確定中...');
+      parent.postMessage({ pluginMessage: { type: 'start-import', approvals } }, '*');
+    };
+
+    document.getElementById('cancel').onclick = () => parent.postMessage({ pluginMessage: { type: 'cancel' } }, '*');
+    document.getElementById('finalize').onclick = () => {
+      const visualReviews = [];
+      for (const [artboardGuid, result] of visualResults) {
+        const checkbox = document.getElementById(`visual-${safeId(artboardGuid)}`);
+        visualReviews.push({
+          artboardGuid,
+          referenceSha256: result.referenceSha256,
+          figmaSha256: result.figmaSha256,
+          ssim: result.ssim,
+          diffPixelRate: result.diffPixelRate,
+          dimensionsMatch: result.dimensionsMatch,
+          heatmapBytes: result.heatmap ? dataUrlBytes(result.heatmap) : undefined,
+          approved: checkbox?.checked ?? false,
+          approver: { name: 'Figma current user' },
+          approvedAt: new Date().toISOString(),
+          packageHash,
+        });
+      }
+      document.getElementById('finalize').disabled = true;
+      setStatus('視覚確認記録を保存中...');
+      parent.postMessage({ pluginMessage: { type: 'finalize-import', visualReviews } }, '*');
+    };
+    document.getElementById('cleanup').onclick = () => {
+      document.getElementById('cleanup').disabled = true;
+      parent.postMessage({ pluginMessage: { type: 'cleanup-staging', pageIds: recoveryPageIds } }, '*');
+    };
+
+    window.onmessage = async (event) => {
+      const message = event.data.pluginMessage;
+      if (!message) return;
+      if (message.type === 'recovery-required') {
+        recoveryPageIds = message.pages.map((page) => page.id);
+        document.getElementById('recoveryText').textContent = message.pages.map((page) => page.name).join('\n');
+        document.getElementById('recovery').style.display = 'block';
+      } else if (message.type === 'recovery-complete') {
+        document.getElementById('recovery').style.display = 'none';
+      } else if (message.type === 'preflight-result') {
+        issues = message.issues;
+        renderIssues(issues);
+        const fatalCount = issues.filter((issue) => issue.severity === 'fatal').length;
+        setStatus(`全件インポートモード\nアートボード ${message.stats.artboards} / ノード ${message.stats.nodes} / 画像 ${message.stats.assets}\nNoto Sans等へのフォント置換 ${message.stats.fontSubstitutions} / Fatal ${fatalCount} / 警告 ${issues.length - fatalCount}`);
+        importButton.disabled = fatalCount > 0;
+      } else if (message.type === 'ready-for-assets') {
+        try { await transferAssets(new Set(message.excludedArtboards)); }
+        catch (error) { setStatus(`画像転送エラー: ${error.message || error}`); }
+      } else if (message.type === 'asset-ack' || message.type === 'asset-complete') {
+        if (ackResolver) { const resolve = ackResolver; ackResolver = null; resolve(message); }
+      } else if (message.type === 'visual-candidate') {
+        const bytes = new Uint8Array(message.bytes);
+        visualWork = visualWork.then(() => compareVisual(message.artboardGuid, bytes)).catch((error) => {
+          visualResults.set(message.artboardGuid, { referenceSha256: null, figmaSha256: '', ssim: null, diffPixelRate: null, dimensionsMatch: null, heatmap: null, error: error.message || String(error) });
+        });
+      } else if (message.type === 'visual-candidate-unavailable') {
+        visualResults.set(message.artboardGuid, { referenceSha256: null, figmaSha256: '', ssim: null, diffPixelRate: null, dimensionsMatch: null, heatmap: null, error: message.reason });
+      } else if (message.type === 'visual-review-required') {
+        try {
+          await visualWork;
+          if (!message.referencesAvailable) {
+            setStatus(`座標補正済みデータを生成しました: ${message.imported.length}件\nreference画像は移植に不要なため、視覚差分を省略して確定中です。`);
+            parent.postMessage({ pluginMessage: { type: 'finalize-import', visualReviews: [] } }, '*');
+            return;
+          }
+          renderVisualReviews(message.imported);
+          setStatus(`ベストエフォート生成完了: ${message.imported.length}件\n視覚差分は任意確認です。そのまま全件確定できます。`);
+        } catch (error) {
+          setStatus(`視覚差分エラー: ${error.message || error}`);
+        }
+      } else if (message.type === 'import-complete') {
+        setStatus(`完了: ${message.imported.length}件\n除外: ${message.excluded.length}件\n生成不能: ${message.failed.length}件`);
+      } else if (message.type === 'error') {
+        setStatus(`エラー: ${message.message}`);
+        importButton.disabled = false;
+      }
+    };
+
+    async function transferAssets(excludedArtboards) {
+      const assets = documentData.assets.filter((asset) => asset.usages.some((usage) => !excludedArtboards.has(usage.artboardGuid)));
+      for (let index = 0; index < assets.length; index += 1) {
+        const asset = assets[index];
+        const entry = requiredEntry(asset.path);
+        const sourceBytes = await readEntry(packageFile, entry);
+        if (await sha256Hex(sourceBytes) !== asset.sha256) throw new Error(`HASH_MISMATCH: ${asset.assetId}`);
+        const prepared = await prepareAsset(asset, sourceBytes);
+        setStatus(`画像転送 ${index + 1}/${assets.length}: ${asset.originalFileName || asset.assetId}`);
+        await postAndWait({ type: 'asset-start', assetId: asset.assetId, sha256: prepared.sha256, sourceSha256: asset.sha256, totalBytes: prepared.bytes.length, transform: prepared.transform });
+        for (let offset = 0; offset < prepared.bytes.length; offset += CHUNK_BYTES) {
+          await postAndWait({ type: 'asset-chunk', assetId: asset.assetId, chunk: prepared.bytes.slice(offset, offset + CHUNK_BYTES) });
+        }
+        await postAndWait({ type: 'asset-end', assetId: asset.assetId });
+      }
+      setStatus('Figmaノードを生成中...');
+      parent.postMessage({ pluginMessage: { type: 'finish-assets' } }, '*');
+    }
+
+    function postAndWait(pluginMessage) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { ackResolver = null; reject(new Error('Figma sandboxの応答がタイムアウトしました。')); }, 30000);
+        ackResolver = (message) => { clearTimeout(timer); resolve(message); };
+        parent.postMessage({ pluginMessage }, '*');
+      });
+    }
+
+    function renderIssues(values) {
+      issueList.replaceChildren();
+      for (const issue of values) {
+        const item = document.createElement('div');
+        item.className = `issue ${issue.severity}`;
+        if (issue.severity === 'approvable') {
+          const label = document.createElement('label');
+          const checkbox = document.createElement('input');
+          checkbox.type = 'checkbox';
+          checkbox.id = `approve-${safeId(issue.id)}`;
+          const body = document.createElement('span');
+          appendIssueText(body, issue);
+          const select = document.createElement('select');
+          select.id = `action-${safeId(issue.id)}`;
+          for (const action of issue.allowedActions) {
+            const option = document.createElement('option');
+            option.value = action;
+            option.textContent = action;
+            select.appendChild(option);
+          }
+          body.appendChild(select);
+          label.append(checkbox, body);
+          item.appendChild(label);
+        } else appendIssueText(item, issue);
+        issueList.appendChild(item);
+      }
+    }
+
+    function appendIssueText(parentNode, issue) {
+      const title = document.createElement('div');
+      title.className = 'code';
+      title.textContent = `[${issue.severity}] ${issue.code}`;
+      const message = document.createElement('div');
+      message.textContent = issue.message;
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.textContent = `Artboards: ${issue.artboardGuids.length} / Nodes: ${issue.nodeGuids.length}`;
+      parentNode.append(title, message, meta);
+    }
+
+    function actionParameters(action, issue) {
+      if (action === 'DOWNSCALE_IMAGE') return { maxDimension: 4096, preserveAspectRatio: true, browserResampler: true, originalSha256: issue.details?.sha256 };
+      return {};
+    }
+
+    async function prepareAsset(asset, sourceBytes) {
+      if (asset.width <= 4096 && asset.height <= 4096) return { bytes: sourceBytes, sha256: asset.sha256 };
+      const bitmap = await createImageBitmap(new Blob([sourceBytes], { type: asset.mimeType }));
+      const sourceWidth = bitmap.width;
+      const sourceHeight = bitmap.height;
+      const scale = Math.min(1, 4096 / sourceWidth, 4096 / sourceHeight);
+      const width = Math.max(1, Math.round(sourceWidth * scale));
+      const height = Math.max(1, Math.round(sourceHeight * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d', { alpha: true });
+      if (!context) throw new Error('画像縮小用Canvasを作成できません。');
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = 'high';
+      context.drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+      const outputType = asset.mimeType === 'image/jpeg' ? 'image/jpeg' : 'image/png';
+      const blob = await new Promise((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error('画像縮小に失敗しました。')), outputType, 0.92));
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      return {
+        bytes,
+        sha256: await sha256Hex(bytes),
+        transform: { type: 'DOWNSCALE_IMAGE', sourceWidth, sourceHeight, width, height, scale, outputType, originalSha256: asset.sha256 },
+      };
+    }
+
+    async function readAndVerify(path) {
+      const bytes = await readEntry(packageFile, requiredEntry(path));
+      const expected = manifest.files[path];
+      if (!expected || expected.size !== bytes.length || await sha256Hex(bytes) !== expected.sha256) throw new Error(`HASH_MISMATCH: ${path}`);
+      return bytes;
+    }
+
+    function requiredEntry(path) {
+      const entry = directory.get(path);
+      if (!entry) throw new Error(`パッケージ内に ${path} がありません。`);
+      return entry;
+    }
+
+    async function readCentralDirectory(file) {
+      const tailStart = Math.max(0, file.size - 65557);
+      const tail = new Uint8Array(await file.slice(tailStart).arrayBuffer());
+      let eocd = -1;
+      for (let offset = tail.length - 22; offset >= 0; offset--) {
+        if (read32(tail, offset) === 0x06054b50) { eocd = offset; break; }
+      }
+      if (eocd < 0) throw new Error('ZIP central directoryが見つかりません。');
+      const count = read16(tail, eocd + 10);
+      if (count > V1_LIMITS.entries) throw new Error('PACKAGE_TOO_LARGE: ZIP entries');
+      const centralSize = read32(tail, eocd + 12);
+      const centralOffset = read32(tail, eocd + 16);
+      const bytes = new Uint8Array(await file.slice(centralOffset, centralOffset + centralSize).arrayBuffer());
+      const entries = new Map();
+      let offset = 0;
+      for (let index = 0; index < count; index++) {
+        if (read32(bytes, offset) !== 0x02014b50) throw new Error('ZIP entryが不正です。');
+        const compression = read16(bytes, offset + 10);
+        const compressedSize = read32(bytes, offset + 20);
+        const uncompressedSize = read32(bytes, offset + 24);
+        const nameLength = read16(bytes, offset + 28);
+        const extraLength = read16(bytes, offset + 30);
+        const commentLength = read16(bytes, offset + 32);
+        const localOffset = read32(bytes, offset + 42);
+        const name = decoder.decode(bytes.slice(offset + 46, offset + 46 + nameLength));
+        const segments = name.split('/');
+        if (!name || name.includes('\\') || name.startsWith('/') || /^[A-Za-z]:/.test(name) || segments.some((segment) => !segment || segment === '.' || segment === '..')) throw new Error(`危険なZIPパス: ${name}`);
+        if (entries.has(name)) throw new Error(`重複したZIPパス: ${name}`);
+        if (compression !== 0 && compression !== 8) throw new Error(`未対応ZIP圧縮方式: ${compression}`);
+        entries.set(name, { name, compression, compressedSize, uncompressedSize, localOffset });
+        offset += 46 + nameLength + extraLength + commentLength;
+      }
+      return entries;
+    }
+
+    function validatePackageDirectory(entries, packageManifest) {
+      if (!packageManifest || packageManifest.schemaVersion !== 1 || !packageManifest.files) throw new Error('SCHEMA_UNSUPPORTED');
+      const expected = new Set(['manifest.json', ...Object.keys(packageManifest.files)]);
+      let uncompressed = 0;
+      let assets = 0;
+      for (const [name, entry] of entries) {
+        if (!expected.has(name)) throw new Error(`manifestに無いZIP entryです: ${name}`);
+        uncompressed += entry.uncompressedSize;
+        if (name.startsWith('assets/') && name !== 'assets/index.json') assets += entry.uncompressedSize;
+      }
+      for (const [name, declaration] of Object.entries(packageManifest.files)) {
+        const entry = entries.get(name);
+        if (!entry) throw new Error(`パッケージ内に ${name} がありません。`);
+        if (entry.uncompressedSize !== declaration.size) throw new Error(`ZIP展開サイズ不一致: ${name}`);
+      }
+      if (uncompressed > V1_LIMITS.uncompressedBytes || assets > V1_LIMITS.assetBytes) throw new Error('PACKAGE_TOO_LARGE: expanded payload');
+    }
+
+    async function readEntry(file, entry) {
+      const header = new Uint8Array(await file.slice(entry.localOffset, entry.localOffset + 30).arrayBuffer());
+      if (read32(header, 0) !== 0x04034b50) throw new Error(`ZIP local entryが不正です: ${entry.name}`);
+      const dataOffset = entry.localOffset + 30 + read16(header, 26) + read16(header, 28);
+      const compressed = new Uint8Array(await file.slice(dataOffset, dataOffset + entry.compressedSize).arrayBuffer());
+      if (entry.compression === 0) return compressed;
+      if (entry.compression !== 8) throw new Error(`未対応ZIP圧縮方式: ${entry.compression}`);
+      const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+      const result = new Uint8Array(await new Response(stream).arrayBuffer());
+      if (result.length !== entry.uncompressedSize) throw new Error(`ZIP展開サイズ不一致: ${entry.name}`);
+      return result;
+    }
+
+    async function sha256Hex(bytes) {
+      const constants = new Uint32Array([
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+      ]);
+      const rotateRight = (value, shift) => value >>> shift | value << 32 - shift;
+      const bitLength = bytes.length * 8;
+      const paddedLength = Math.ceil((bytes.length + 9) / 64) * 64;
+      const message = new Uint8Array(paddedLength);
+      message.set(bytes);
+      message[bytes.length] = 0x80;
+      const view = new DataView(message.buffer);
+      view.setUint32(paddedLength - 8, Math.floor(bitLength / 0x100000000), false);
+      view.setUint32(paddedLength - 4, bitLength >>> 0, false);
+      const hash = new Uint32Array([
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+      ]);
+      const schedule = new Uint32Array(64);
+      for (let offset = 0; offset < paddedLength; offset += 64) {
+        for (let index = 0; index < 16; index++) schedule[index] = view.getUint32(offset + index * 4, false);
+        for (let index = 16; index < 64; index++) {
+          const s0 = rotateRight(schedule[index - 15], 7) ^ rotateRight(schedule[index - 15], 18) ^ schedule[index - 15] >>> 3;
+          const s1 = rotateRight(schedule[index - 2], 17) ^ rotateRight(schedule[index - 2], 19) ^ schedule[index - 2] >>> 10;
+          schedule[index] = (schedule[index - 16] + s0 + schedule[index - 7] + s1) >>> 0;
+        }
+        let [a, b, c, d, e, f, g, h] = hash;
+        for (let index = 0; index < 64; index++) {
+          const upper1 = rotateRight(e, 6) ^ rotateRight(e, 11) ^ rotateRight(e, 25);
+          const choice = e & f ^ ~e & g;
+          const temp1 = (h + upper1 + choice + constants[index] + schedule[index]) >>> 0;
+          const upper0 = rotateRight(a, 2) ^ rotateRight(a, 13) ^ rotateRight(a, 22);
+          const majority = a & b ^ a & c ^ b & c;
+          const temp2 = (upper0 + majority) >>> 0;
+          h = g; g = f; f = e; e = (d + temp1) >>> 0;
+          d = c; c = b; b = a; a = (temp1 + temp2) >>> 0;
+        }
+        hash[0] = (hash[0] + a) >>> 0; hash[1] = (hash[1] + b) >>> 0;
+        hash[2] = (hash[2] + c) >>> 0; hash[3] = (hash[3] + d) >>> 0;
+        hash[4] = (hash[4] + e) >>> 0; hash[5] = (hash[5] + f) >>> 0;
+        hash[6] = (hash[6] + g) >>> 0; hash[7] = (hash[7] + h) >>> 0;
+      }
+      return Array.from(hash, (value) => value.toString(16).padStart(8, '0')).join('');
+    }
+
+    async function compareVisual(artboardGuid, figmaBytes) {
+      const figmaSha256 = await sha256Hex(figmaBytes);
+      const reference = documentData.references?.find((item) => item.artboardGuid === artboardGuid);
+      if (!reference) {
+        visualResults.set(artboardGuid, { referenceSha256: null, figmaSha256, ssim: null, diffPixelRate: null, dimensionsMatch: null, heatmap: null });
+        return;
+      }
+      const referenceBytes = await readAndVerify(reference.path);
+      if (await sha256Hex(referenceBytes) !== reference.sha256) throw new Error(`HASH_MISMATCH: ${reference.path}`);
+      const [sourceBitmap, figmaBitmap] = await Promise.all([
+        createImageBitmap(new Blob([referenceBytes], { type: 'image/png' })),
+        createImageBitmap(new Blob([figmaBytes], { type: 'image/png' })),
+      ]);
+      const width = Math.max(sourceBitmap.width, figmaBitmap.width);
+      const height = Math.max(sourceBitmap.height, figmaBitmap.height);
+      const dimensionsMatch = sourceBitmap.width === figmaBitmap.width && sourceBitmap.height === figmaBitmap.height;
+      const sourcePixels = bitmapPixels(sourceBitmap, width, height);
+      const figmaPixels = bitmapPixels(figmaBitmap, width, height);
+      const heatmapCanvas = document.createElement('canvas');
+      heatmapCanvas.width = width;
+      heatmapCanvas.height = height;
+      const heatmapContext = heatmapCanvas.getContext('2d');
+      const heatmapData = heatmapContext.createImageData(width, height);
+      let differencePixels = 0;
+      let sourceMean = 0;
+      let figmaMean = 0;
+      const pixelCount = width * height;
+      for (let offset = 0; offset < sourcePixels.length; offset += 4) {
+        const delta = Math.max(Math.abs(sourcePixels[offset] - figmaPixels[offset]), Math.abs(sourcePixels[offset + 1] - figmaPixels[offset + 1]), Math.abs(sourcePixels[offset + 2] - figmaPixels[offset + 2]), Math.abs(sourcePixels[offset + 3] - figmaPixels[offset + 3]));
+        if (delta > 1) differencePixels++;
+        heatmapData.data[offset] = delta;
+        heatmapData.data[offset + 1] = 0;
+        heatmapData.data[offset + 2] = 0;
+        heatmapData.data[offset + 3] = Math.min(255, delta * 4);
+        sourceMean += luminance(sourcePixels, offset);
+        figmaMean += luminance(figmaPixels, offset);
+      }
+      sourceMean /= pixelCount;
+      figmaMean /= pixelCount;
+      let sourceVariance = 0;
+      let figmaVariance = 0;
+      let covariance = 0;
+      for (let offset = 0; offset < sourcePixels.length; offset += 4) {
+        const sourceDelta = luminance(sourcePixels, offset) - sourceMean;
+        const figmaDelta = luminance(figmaPixels, offset) - figmaMean;
+        sourceVariance += sourceDelta * sourceDelta;
+        figmaVariance += figmaDelta * figmaDelta;
+        covariance += sourceDelta * figmaDelta;
+      }
+      const divisor = Math.max(1, pixelCount - 1);
+      sourceVariance /= divisor;
+      figmaVariance /= divisor;
+      covariance /= divisor;
+      const c1 = (0.01 * 255) ** 2;
+      const c2 = (0.03 * 255) ** 2;
+      const ssim = ((2 * sourceMean * figmaMean + c1) * (2 * covariance + c2)) / ((sourceMean ** 2 + figmaMean ** 2 + c1) * (sourceVariance + figmaVariance + c2));
+      heatmapContext.putImageData(heatmapData, 0, 0);
+      sourceBitmap.close();
+      figmaBitmap.close();
+      visualResults.set(artboardGuid, {
+        referenceSha256: reference.sha256,
+        figmaSha256,
+        ssim,
+        diffPixelRate: differencePixels / pixelCount,
+        dimensionsMatch,
+        heatmap: heatmapPreview(heatmapCanvas),
+      });
+    }
+
+    function heatmapPreview(source) {
+      const scale = Math.min(1, 800 / source.width, 400 / source.height);
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(source.width * scale));
+      canvas.height = Math.max(1, Math.round(source.height * scale));
+      canvas.getContext('2d').drawImage(source, 0, 0, canvas.width, canvas.height);
+      return canvas.toDataURL('image/png');
+    }
+
+    function dataUrlBytes(value) {
+      const encoded = value.slice(value.indexOf(',') + 1);
+      const binary = atob(encoded);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index++) bytes[index] = binary.charCodeAt(index);
+      return bytes;
+    }
+
+    function bitmapPixels(bitmap, width, height) {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext('2d', { willReadFrequently: true });
+      context.clearRect(0, 0, width, height);
+      context.drawImage(bitmap, 0, 0);
+      return context.getImageData(0, 0, width, height).data;
+    }
+
+    function luminance(pixels, offset) {
+      return 0.2126 * pixels[offset] + 0.7152 * pixels[offset + 1] + 0.0722 * pixels[offset + 2];
+    }
+
+    function renderVisualReviews(imported) {
+      const container = document.getElementById('visualItems');
+      container.replaceChildren();
+      for (const artboardGuid of imported) {
+        const result = visualResults.get(artboardGuid);
+        const item = document.createElement('div');
+        item.className = 'visual-item';
+        const label = document.createElement('label');
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.id = `visual-${safeId(artboardGuid)}`;
+        checkbox.checked = Boolean(result && !result.error && result.figmaSha256);
+        const text = document.createElement('span');
+        text.textContent = !result || result.ssim === null
+          ? `${artboardGuid}: ${result?.error ? `視覚差分を生成できませんでした（${result.error}）` : '基準PNGなし（任意確認）'}`
+          : `${artboardGuid}: SSIM ${result.ssim.toFixed(5)} / 差分画素 ${(result.diffPixelRate * 100).toFixed(3)}% / 寸法 ${result.dimensionsMatch ? '一致' : '不一致'}`;
+        label.append(checkbox, text);
+        item.appendChild(label);
+        if (result?.heatmap) {
+          const image = document.createElement('img');
+          image.alt = `${artboardGuid} difference heatmap`;
+          image.src = result.heatmap;
+          item.appendChild(image);
+        }
+        container.appendChild(item);
+      }
+      document.getElementById('visualReview').style.display = 'block';
+      document.getElementById('finalize').disabled = false;
+    }
+
+    function read16(bytes, offset) { return bytes[offset] | bytes[offset + 1] << 8; }
+    function read32(bytes, offset) { return (bytes[offset] | bytes[offset + 1] << 8 | bytes[offset + 2] << 16 | bytes[offset + 3] << 24) >>> 0; }
+    function safeId(value) { return value.replace(/[^a-zA-Z0-9_-]/g, '_'); }
+    function setStatus(text) { status.textContent = text; }
+  </script>
+</body>
+</html>

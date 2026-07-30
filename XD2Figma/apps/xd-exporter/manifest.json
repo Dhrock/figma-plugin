@@ -1,0 +1,11 @@
+{
+  "manifestVersion": 4,
+  "id": "xd2figma-exporter-development",
+  "name": "XD2Figma Exporter",
+  "version": "0.1.0",
+  "main": "code.js",
+  "host": { "app": "XD", "minVersion": "57.0" },
+  "entrypoints": [
+    { "type": "command", "id": "exportXd2Figma", "label": { "default": "Export for XD2Figma" } }
+  ]
+}

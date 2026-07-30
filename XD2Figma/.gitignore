@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.xd2fig
+*.log
+.work/
+output/

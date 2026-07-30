@@ -1,0 +1,20 @@
+{
+  "name": "xd2fig-migration",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Auditable Adobe XD to Figma migration tooling",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node tools/build-plugins.mjs && node tools/copy-plugin-assets.mjs",
+    "build:mac-app": "npm run build && node tools/build-macos-app.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "package": "node dist/tools/package-cli.js",
+    "direct-xd": "node dist/tools/xd-direct-cli.js",
+    "clean": "node tools/clean.mjs"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.123.0",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.6",
+    "typescript": "^5.9.3"
+  }
+}
