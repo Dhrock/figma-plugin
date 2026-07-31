@@ -12,3 +12,4 @@ export * from './text-ranges';
 export * from './text-display';
 export * from './blend-mode';
 export * from './clip-path';
+export * from './vector-geometry';

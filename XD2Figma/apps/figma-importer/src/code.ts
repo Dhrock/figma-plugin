@@ -2,12 +2,15 @@ import {
   collectArtboardIssues,
   applyLayerDatabase,
   applyPlainTextDocument,
+  figmaRotationFromXdDegrees,
   layerRecordMap,
   normalizeCharactersForFigma,
   normalizePortableBlendMode,
   normalizeSvgPathToOrigin,
   resolveXdTextStyleRanges,
   sha256HexSync,
+  transformLocalOffset,
+  transformedVisualBounds,
   validateManifest,
   type ApprovalRecord,
   type MigrationIssue,
@@ -536,19 +539,27 @@ async function createNodeTree(guid: string, parent: BaseNode & ChildrenMixin, so
     fallbackReason = error instanceof Error ? error.message : String(error);
   }
   parent.appendChild(node);
-  try { applyCommonBeforePosition(node, source); }
+  try {
+    applyCommonBeforePosition(node, source);
+  }
   catch (error) {
     fallbackCode = fallbackCode ?? 'PROPERTY_APPLICATION_FALLBACK';
     fallbackReason = error instanceof Error ? error.message : String(error);
   }
   mapping.set(guid, node);
-  if (fallbackCode) markFallbackNode(node, source, fallbackCode, fallbackReason);
   if ('children' in node) {
     for (const childGuid of figmaChildOrder(source, sourceNodes)) await createNodeTree(childGuid, node as BaseNode & ChildrenMixin, sourceNodes, mapping);
     applyFigmaChildRoles(source, sourceNodes, mapping);
   }
   const contentFitOffset = fitContainerToContents(node, source);
+  try {
+    applyRotationBeforePosition(node, source);
+  } catch (error) {
+    fallbackCode = fallbackCode ?? 'ROTATION_APPLICATION_FALLBACK';
+    fallbackReason = error instanceof Error ? error.message : String(error);
+  }
   commitNodePosition(node, source, contentFitOffset);
+  if (fallbackCode) markFallbackNode(node, source, fallbackCode, fallbackReason);
   return node;
 }
 
@@ -556,7 +567,12 @@ async function createFigmaNode(source: XdNode): Promise<SceneNode> {
   switch (source.type) {
     case 'RECTANGLE': return figma.createRectangle();
     case 'ELLIPSE': return figma.createEllipse();
-    case 'LINE': return figma.createLine();
+    case 'LINE': {
+      if (!source.pathData) return figma.createLine();
+      const vector = createNormalizedVector(source);
+      vector.setSharedPluginData(NAMESPACE, 'lineRepresentation', 'VECTOR_PATH');
+      return vector;
+    }
     case 'POLYGON': {
       const polygon = figma.createPolygon();
       if (source.polygonPointCount !== undefined) polygon.pointCount = Math.max(3, Math.round(source.polygonPointCount));
@@ -564,15 +580,7 @@ async function createFigmaNode(source: XdNode): Promise<SceneNode> {
     }
     case 'PATH':
     case 'BOOLEAN_GROUP': {
-      const vector = figma.createVector();
-      if (!source.pathData) throw new Error(`PATH_DATA_MISSING: ${source.guid}`);
-      const normalized = normalizeSvgPathToOrigin(source.pathData, source.windingRule ?? 'NONZERO', { maxDeviationPx: 0.01 });
-      vector.vectorPaths = [{ data: normalized.originPathData, windingRule: normalized.windingRule }];
-      vector.setSharedPluginData(NAMESPACE, 'pathOriginOffset', JSON.stringify({
-        x: source.pathOffsetX ?? normalized.bounds.x,
-        y: source.pathOffsetY ?? normalized.bounds.y,
-      }));
-      return vector;
+      return createNormalizedVector(source);
     }
     case 'TEXT': return createTextNode(source);
     default: {
@@ -583,6 +591,18 @@ async function createFigmaNode(source: XdNode): Promise<SceneNode> {
       return frame;
     }
   }
+}
+
+function createNormalizedVector(source: XdNode): VectorNode {
+  if (!source.pathData) throw new Error(`PATH_DATA_MISSING: ${source.guid}`);
+  const vector = figma.createVector();
+  const normalized = normalizeSvgPathToOrigin(source.pathData, source.windingRule ?? 'NONZERO', { maxDeviationPx: 0.01 });
+  vector.vectorPaths = [{ data: normalized.originPathData, windingRule: normalized.windingRule }];
+  vector.setSharedPluginData(NAMESPACE, 'pathOriginOffset', JSON.stringify({
+    x: source.pathOffsetX ?? normalized.bounds.x,
+    y: source.pathOffsetY ?? normalized.bounds.y,
+  }));
+  return vector;
 }
 
 async function createTextNode(source: XdNode): Promise<TextNode> {
@@ -686,7 +706,6 @@ function applyCommonBeforePosition(node: SceneNode, source: XdNode): void {
   if (source.clipPathBounds) {
     node.setSharedPluginData(NAMESPACE, 'sourceClipPathBounds', JSON.stringify(source.clipPathBounds));
   }
-  if ('rotation' in node) node.rotation = source.rotation;
   node.setSharedPluginData(NAMESPACE, 'sourceGuid', source.guid);
   node.setSharedPluginData(NAMESPACE, 'sourceType', source.type);
   const layer = state?.layerRecords.get(source.guid);
@@ -698,16 +717,38 @@ function applyCommonBeforePosition(node: SceneNode, source: XdNode): void {
   }
 }
 
+function applyRotationBeforePosition(node: SceneNode, source: XdNode): void {
+  if (!('rotation' in node)) return;
+  // XD's positive angle is clockwise, but Figma's documented rotation matrix
+  // uses the opposite sign. Fit/resize first, map the angle, then commit the
+  // translation separately so rotation always precedes movement.
+  const figmaRotation = figmaRotationFromXdDegrees(source.rotation);
+  node.rotation = figmaRotation;
+  if (Math.abs(source.rotation) > 0.000001) {
+    node.setSharedPluginData(NAMESPACE, 'sourceRotationClockwise', String(source.rotation));
+    node.setSharedPluginData(NAMESPACE, 'figmaRotation', String(figmaRotation));
+    node.setSharedPluginData(NAMESPACE, 'rotationMapping', 'XD_CLOCKWISE_TO_FIGMA_NEGATED');
+    node.setSharedPluginData(NAMESPACE, 'transformSequence', 'RESIZE_ROTATE_TRANSLATE');
+  }
+}
+
 function commitNodePosition(node: SceneNode, source: XdNode, contentFitOffset: { x: number; y: number }): void {
   // Text auto-sizing, vector normalization, container content fitting and
   // rotation can rewrite transforms. Commit the layer-DB-relative position last.
   const position = importedNodePosition(node, source);
-  node.x = position.x + contentFitOffset.x;
-  node.y = position.y + contentFitOffset.y;
+  const localCorrection = {
+    x: position.x - source.x + contentFitOffset.x,
+    y: position.y - source.y + contentFitOffset.y,
+  };
+  const parentCorrection = transformLocalOffset(node.relativeTransform, localCorrection);
+  node.x = source.x + parentCorrection.x;
+  node.y = source.y + parentCorrection.y;
   if (position.x !== source.x) node.setSharedPluginData(NAMESPACE, 'textAnchorCorrectionX', String(position.x - source.x));
   if (position.y !== source.y) node.setSharedPluginData(NAMESPACE, 'textAnchorCorrectionY', String(position.y - source.y));
   if (contentFitOffset.x || contentFitOffset.y) {
     node.setSharedPluginData(NAMESPACE, 'contentFitOffset', JSON.stringify(contentFitOffset));
+    node.setSharedPluginData(NAMESPACE, 'contentFitOffsetSpace', 'XD_LOCAL_ROTATED_TO_PARENT');
+    node.setSharedPluginData(NAMESPACE, 'contentFitParentCorrection', JSON.stringify(parentCorrection));
   }
 }
 
@@ -798,10 +839,16 @@ function fitContainerToContents(node: SceneNode, source: XdNode): { x: number; y
     || (source.layout?.type && source.layout.type !== 'NONE')
   ) return { x: 0, y: 0 };
 
-  const minX = Math.min(...node.children.map((child) => child.x));
-  const minY = Math.min(...node.children.map((child) => child.y));
-  const maxX = Math.max(...node.children.map((child) => child.x + child.width));
-  const maxY = Math.max(...node.children.map((child) => child.y + child.height));
+  const visualBounds = node.children.map((child) => transformedVisualBounds(
+    child.width,
+    child.height,
+    child.relativeTransform,
+    visibleStrokeOutset(child),
+  ));
+  const minX = Math.min(...visualBounds.map((bounds) => bounds.x));
+  const minY = Math.min(...visualBounds.map((bounds) => bounds.y));
+  const maxX = Math.max(...visualBounds.map((bounds) => bounds.x + bounds.width));
+  const maxY = Math.max(...visualBounds.map((bounds) => bounds.y + bounds.height));
   const width = Math.max(0.01, maxX - minX);
   const height = Math.max(0.01, maxY - minY);
   for (const child of node.children) {
@@ -811,6 +858,22 @@ function fitContainerToContents(node: SceneNode, source: XdNode): { x: number; y
   node.resizeWithoutConstraints(width, height);
   node.setSharedPluginData(NAMESPACE, 'contentFitBounds', JSON.stringify({ x: minX, y: minY, width, height }));
   return { x: minX, y: minY };
+}
+
+function visibleStrokeOutset(node: SceneNode): number {
+  if (
+    !('strokes' in node)
+    || !Array.isArray(node.strokes)
+    || !node.strokes.some((paint) => paint.visible !== false && (paint.opacity ?? 1) > 0)
+    || !('strokeWeight' in node)
+    || typeof node.strokeWeight !== 'number'
+    || !Number.isFinite(node.strokeWeight)
+    || node.strokeWeight <= 0
+  ) return 0;
+  const align = 'strokeAlign' in node ? node.strokeAlign : 'CENTER';
+  if (align === 'OUTSIDE') return node.strokeWeight;
+  if (align === 'CENTER') return node.strokeWeight / 2;
+  return 0;
 }
 
 function sourceTypeSupportsChildren(type: XdNode['type']): boolean {
@@ -969,11 +1032,17 @@ function validateBuiltSubtree(root: XdNode, sources: Map<string, XdNode>, mappin
     } else {
       const layer = state?.layerRecords.get(source.guid);
       if (!layer) throw new Error(`STRUCTURE_MISMATCH layer-record=${source.guid}`);
-      const actual = figmaArtboardPosition(source, sources, mapping);
-      const imported = importedNodePosition(target, source);
       const fitOffset = contentFitOffset(target);
-      assertClose(actual.x, layer.artboardBounds.x + imported.x - source.x + fitOffset.x, 'artboard-x', source.guid);
-      assertClose(actual.y, layer.artboardBounds.y + imported.y - source.y + fitOffset.y, 'artboard-y', source.guid);
+      const imported = importedNodePosition(target, source);
+      const parentCorrection = transformLocalOffset(target.relativeTransform, {
+        x: imported.x - source.x + fitOffset.x,
+        y: imported.y - source.y + fitOffset.y,
+      });
+      const parentTarget = source.parentGuid ? mapping.get(source.parentGuid) : null;
+      if (!parentTarget) throw new Error(`STRUCTURE_MISMATCH parent=${source.guid}`);
+      const parentFitOffset = contentFitOffset(parentTarget);
+      assertClose(target.x, source.x + parentCorrection.x - parentFitOffset.x, 'parent-x', source.guid);
+      assertClose(target.y, source.y + parentCorrection.y - parentFitOffset.y, 'parent-y', source.guid);
     }
     if (source.type === 'TEXT' && source.text?.layoutBox === 'POINT') {
       if (target.type !== 'TEXT' || target.textAutoResize !== 'WIDTH_AND_HEIGHT') {
@@ -994,7 +1063,7 @@ function validateBuiltSubtree(root: XdNode, sources: Map<string, XdNode>, mappin
         assertClose(target.height, Math.max(0.01, source.height), 'height', source.guid);
       }
     }
-    if ('rotation' in target) assertClose(target.rotation, source.rotation, 'rotation', source.guid);
+    if ('rotation' in target) assertClose(target.rotation, figmaRotationFromXdDegrees(source.rotation), 'rotation', source.guid);
     if ('opacity' in target) assertClose(target.opacity, clamp(source.opacity, 0, 1), 'opacity', source.guid);
     if (target.visible !== source.visible || target.locked !== source.locked) throw new Error(`STRUCTURE_MISMATCH flags=${source.guid}`);
     if (source.type === 'TEXT' && target.type === 'TEXT' && target.characters !== normalizeCharactersForFigma(source.text?.characters ?? '')) {
@@ -1024,31 +1093,6 @@ function validateBuiltSubtree(root: XdNode, sources: Map<string, XdNode>, mappin
     }
   };
   visit(root);
-}
-
-function figmaArtboardPosition(
-  source: XdNode,
-  sources: Map<string, XdNode>,
-  mapping: Map<string, SceneNode>,
-): { x: number; y: number } {
-  const target = mapping.get(source.guid);
-  if (!target) throw new Error(`STRUCTURE_MISMATCH missing=${source.guid}`);
-  let x = target.x;
-  let y = target.y;
-  let parentGuid = source.parentGuid;
-  const visited = new Set<string>([source.guid]);
-  while (parentGuid) {
-    if (visited.has(parentGuid)) throw new Error(`STRUCTURE_MISMATCH cycle=${source.guid}`);
-    visited.add(parentGuid);
-    const parentSource = sources.get(parentGuid);
-    const parentTarget = mapping.get(parentGuid);
-    if (!parentSource || !parentTarget) throw new Error(`STRUCTURE_MISMATCH parent=${source.guid}`);
-    if (parentSource.type === 'ARTBOARD') break;
-    x += parentTarget.x;
-    y += parentTarget.y;
-    parentGuid = parentSource.parentGuid;
-  }
-  return { x, y };
 }
 
 function contentFitOffset(node: SceneNode): { x: number; y: number } {

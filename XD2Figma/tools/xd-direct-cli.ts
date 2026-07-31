@@ -20,7 +20,12 @@ import {
   xdPointTextAlignmentGeometry,
   xdPointTextBaselineGeometry,
   xdClipPathBounds,
+  xdLineGeometry,
+  xdPolygonGeometry,
+  xdPolygonPointCount,
+  xdRotationDegrees,
   xdTextFrameLayoutBox,
+  xdTransformPoint,
   type FontAuditRecord,
   type MigrationIssue,
   type XdAsset,
@@ -187,8 +192,9 @@ function convertNode(input: Raw, parentGuid: string, context: ConvertContext, ar
     : null;
   const localOriginX = clipBounds?.x ?? geometry.offsetX;
   const localOriginY = clipBounds?.y ?? geometry.offsetY;
-  const baseX = number(transform.tx) + localOriginX - (artboardChild ? context.artboardX : 0);
-  const baseY = number(transform.ty) + localOriginY - (artboardChild ? context.artboardY : 0);
+  const transformedOrigin = xdTransformPoint(transform, { x: localOriginX, y: localOriginY });
+  const baseX = transformedOrigin.x - (artboardChild ? context.artboardX : 0);
+  const baseY = transformedOrigin.y - (artboardChild ? context.artboardY : 0);
   const childInputs: Raw[] = resolved.group?.children ?? [];
   const children = childInputs.map((child) => convertNode(child, guid, context, false, guid));
   if (clipBounds) {
@@ -215,7 +221,7 @@ function convertNode(input: Raw, parentGuid: string, context: ConvertContext, ar
   const node: XdNode = {
     guid, type, name: String(resolved.name ?? type), parentGuid, artboardGuid: context.artboardGuid, children,
     x: baseX, y: baseY, width: Math.max(0.01, width), height: Math.max(0.01, height),
-    rotation: Math.atan2(number(transform.b), number(transform.a, 1)) * 180 / Math.PI,
+    rotation: xdRotationDegrees(transform),
     visible: resolved.visible !== false, locked: resolved.locked === true,
     opacity: clamp(optionalNumber(resolved.style?.opacity) ?? 1, 0, 1),
     blendMode: typeof resolved.style?.blendMode === 'string' ? resolved.style.blendMode : undefined,
@@ -226,11 +232,13 @@ function convertNode(input: Raw, parentGuid: string, context: ConvertContext, ar
     stroke: colorFromFill(resolved.style?.stroke),
     strokeWidth: optionalNumber(resolved.style?.stroke?.width),
     cornerRadius: optionalNumber(shape.r ?? shape.radius ?? shape.cornerRadius),
-    polygonPointCount: shape.type === 'polygon' ? optionalNumber(shape.points) : undefined,
+    polygonPointCount: shape.type === 'polygon'
+      ? xdPolygonPointCount(shape['uxdesign#cornerCount'], shape.points)
+      : undefined,
     clipContent: Boolean(clip),
     clipPathBounds: clipBounds ?? undefined,
     fixedWhenScrolling: resolved.meta?.ux?.fixed === true,
-    pathData: shape.type === 'path' ? String(shape.path ?? '') : undefined,
+    pathData: shape.type === 'path' ? String(shape.path ?? '') : geometry.pathData,
     windingRule: shape.winding === 'evenodd' ? 'EVENODD' : 'NONZERO',
   };
   if (type === 'TEXT') node.text = textData(resolved, guid, context.fonts);
@@ -324,7 +332,7 @@ function textData(raw: Raw, guid: string, fonts: Map<string, FontAuditRecord>): 
   };
 }
 
-function geometryOf(raw: Raw): { offsetX: number; offsetY: number; width: number; height: number } {
+function geometryOf(raw: Raw): { offsetX: number; offsetY: number; width: number; height: number; pathData?: string } {
   const shape = raw.shape ?? {};
   if (raw.type === 'text') {
     const frame = raw.text?.frame ?? {};
@@ -355,8 +363,27 @@ function geometryOf(raw: Raw): { offsetX: number; offsetY: number; width: number
   if (shape.type === 'ellipse') return { offsetX: number(shape.cx) - number(shape.rx), offsetY: number(shape.cy) - number(shape.ry), width: number(shape.rx) * 2, height: number(shape.ry) * 2 };
   if (shape.type === 'circle') return { offsetX: number(shape.cx) - number(shape.r), offsetY: number(shape.cy) - number(shape.r), width: number(shape.r) * 2, height: number(shape.r) * 2 };
   if (shape.type === 'line') {
-    const x1 = number(shape.x1), x2 = number(shape.x2), y1 = number(shape.y1), y2 = number(shape.y2);
-    return { offsetX: Math.min(x1, x2), offsetY: Math.min(y1, y2), width: Math.max(0.01, Math.abs(x2 - x1)), height: Math.max(0.01, Math.abs(y2 - y1)) };
+    const line = xdLineGeometry(shape.x1, shape.y1, shape.x2, shape.y2);
+    return {
+      offsetX: line.offsetX,
+      offsetY: line.offsetY,
+      width: line.width,
+      height: line.height,
+      pathData: line.pathData,
+    };
+  }
+  if (shape.type === 'polygon') {
+    const polygon = xdPolygonGeometry(
+      Array.isArray(shape.points) ? shape.points : undefined,
+      optionalNumber(shape['uxdesign#width']),
+      optionalNumber(shape['uxdesign#height']),
+    );
+    return {
+      offsetX: polygon.offsetX,
+      offsetY: polygon.offsetY,
+      width: polygon.width,
+      height: polygon.height,
+    };
   }
   if (shape.type === 'path') {
     const bounds = measureSvgPath(String(shape.path ?? ''), { maxDeviationPx: 0.01 });

@@ -209,6 +209,7 @@ export interface XdNode {
   y: number;
   width: number;
   height: number;
+  /** XD's source rotation in clockwise-positive degrees. */
   rotation: number;
   visible: boolean;
   locked: boolean;

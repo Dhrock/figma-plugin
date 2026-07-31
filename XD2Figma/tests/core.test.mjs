@@ -13,6 +13,7 @@ const {
   estimateXdTextFallbackGeometry,
   extractImageMetadata,
   fatal,
+  figmaRotationFromXdDegrees,
   fingerprintDocument,
   normalizeSvgPath,
   parseCoordinateCsv,
@@ -30,11 +31,18 @@ const {
   sanitizeOutputStem,
   sha256HexSync,
   stableStringify,
+  transformLocalOffset,
   validateDocumentLimits,
   xdPointTextAlignmentGeometry,
   xdPointTextBaselineGeometry,
   xdClipPathBounds,
+  xdLineGeometry,
+  xdPolygonGeometry,
+  xdPolygonPointCount,
+  xdRotationDegrees,
   xdTextFrameLayoutBox,
+  xdTransformPoint,
+  transformedVisualBounds,
 } = require('../dist/packages/core/src/index.js');
 
 test('SHA-256 matches the published abc vector', () => {
@@ -110,6 +118,112 @@ test('XD clip-path transform becomes the clipped container origin', () => {
       { a: 0, b: 1, c: -1, d: 0, tx: 100, ty: 200 },
     ),
     { x: 40, y: 210, width: 40, height: 30 },
+  );
+});
+
+test('XD AGC polygon point arrays retain their real geometry and corner count', () => {
+  const points = [
+    { x: 4.800000190734863, y: 0 },
+    { x: 9.600000381469727, y: 8 },
+    { x: 0, y: 8 },
+  ];
+  assert.deepEqual(
+    xdPolygonGeometry(points, 9.600000381469727, 8),
+    {
+      x: 0,
+      y: 0,
+      offsetX: 0,
+      offsetY: 0,
+      width: 9.600000381469727,
+      height: 8,
+    },
+  );
+  assert.equal(xdPolygonPointCount(3, points), 3);
+  assert.equal(xdPolygonPointCount(undefined, points), 3);
+});
+
+test('XD line endpoints become a normalized vector path instead of a resized Figma LineNode', () => {
+  assert.deepEqual(
+    xdLineGeometry(250, 2464.5, 250, 2754.4833374023438),
+    {
+      x: 250,
+      y: 2464.5,
+      offsetX: 250,
+      offsetY: 2464.5,
+      width: 0,
+      height: 289.98333740234375,
+      pathData: 'M 0 0 L 0 289.98333740234375',
+    },
+  );
+  assert.deepEqual(
+    xdLineGeometry(20, 5, 10, 25),
+    {
+      x: 10,
+      y: 5,
+      offsetX: 10,
+      offsetY: 5,
+      width: 10,
+      height: 20,
+      pathData: 'M 10 0 L 0 20',
+    },
+  );
+});
+
+test('rotated vector origin is transformed before final translation', () => {
+  const quarterTurn = { a: 0, b: 1, c: -1, d: 0, tx: 100, ty: 200 };
+  assert.deepEqual(xdTransformPoint(quarterTurn, { x: 10, y: 20 }), { x: 80, y: 210 });
+  assert.equal(xdRotationDegrees(quarterTurn), 90);
+  assert.equal(xdRotationDegrees({ a: -1, b: 0, c: 0, d: -1 }), 180);
+});
+
+test('XD clockwise rotation maps to Figma with the opposite angle sign', () => {
+  assert.equal(figmaRotationFromXdDegrees(90), -90);
+  assert.equal(figmaRotationFromXdDegrees(-90), 90);
+  assert.equal(figmaRotationFromXdDegrees(180), 180);
+  assert.equal(figmaRotationFromXdDegrees(-180), 180);
+  assert.equal(figmaRotationFromXdDegrees(360), 0);
+});
+
+test('content-fit origin offsets rotate into parent space before translation', () => {
+  assert.deepEqual(
+    transformLocalOffset(
+      [[0, 1, 0], [-1, 0, 0]],
+      { x: -4.231500148773193, y: -2.382601261138916 },
+    ),
+    {
+      x: -2.382601261138916,
+      y: 4.231500148773193,
+    },
+  );
+});
+
+test('content fitting uses rotated visual bounds and keeps centered strokes inside', () => {
+  assert.deepEqual(
+    transformedVisualBounds(
+      9.600000381469727,
+      8,
+      [[-1, 0, 169.2998046875], [0, -1, 9]],
+    ),
+    {
+      x: 159.69980430603027,
+      y: 1,
+      width: 9.600000381469727,
+      height: 8,
+    },
+  );
+  assert.deepEqual(
+    transformedVisualBounds(
+      0.01,
+      289.98333740234375,
+      [[1, 0, 0], [0, 1, 0]],
+      0.5,
+    ),
+    {
+      x: -0.5,
+      y: -0.5,
+      width: 1.01,
+      height: 290.98333740234375,
+    },
   );
 });
 
